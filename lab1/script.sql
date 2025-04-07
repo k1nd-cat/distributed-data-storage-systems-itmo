@@ -1,41 +1,94 @@
+-- Создание временной таблицы
 create temp table if not exists temp_trigger_vars (
     id serial primary key,
-    schema_name text not null,
-    table_name text not null
+    full_table_name text not null
 );
 
+-- Очистка временной таблицы
 truncate table temp_trigger_vars;
 
-insert into temp_trigger_vars (schema_name, table_name)
-values (:'schema_name', :'table_name');
+-- Вставка имени таблицы (возможно: table, schema.table, database.schema.table)
+insert into temp_trigger_vars (full_table_name)
+values (:'table_name');
 
 do $$
 declare
+    full_table_name text;
     schema_name text;
     table_name text;
+    parts text[];
+    db_part text;
     trig_record record;
     when_condition text;
     column_name text;
     output_text text := '';
     has_columns boolean;
+    table_oid oid;
+    search_path_arr text[];
 begin
-    select 
-        tv.schema_name, 
-        tv.table_name 
-    into 
-        schema_name, 
-        table_name 
-    from temp_trigger_vars tv 
-    limit 1;
+    -- Получаем полное имя таблицы
+    select tv.full_table_name into full_table_name from temp_trigger_vars tv limit 1;
 
-    if schema_name is null or table_name is null then
-        raise exception 'Данные схемы или таблицы не найдены во временной таблице';
+    if full_table_name is null then
+        raise exception 'Имя таблицы не указано';
     end if;
 
+    -- Разбиваем имя таблицы на части
+    parts := parse_ident(full_table_name);
+
+    -- Проверка количества частей
+    if array_length(parts, 1) < 1 or array_length(parts, 1) > 3 then
+        raise exception 'Недопустимый формат имени таблицы. Используйте: database.schema.table, schema.table или table';
+    end if;
+
+    -- Разбор частей
+    case array_length(parts, 1)
+        when 3 then
+            db_part := parts[1];
+            schema_name := parts[2];
+            table_name := parts[3];
+            if db_part != current_database() then
+                raise exception 'Указанная база данных "%" не совпадает с текущей "%"', db_part, current_database();
+            end if;
+        when 2 then
+            schema_name := parts[1];
+            table_name := parts[2];
+        when 1 then
+            schema_name := null;
+            table_name := parts[1];
+    end case;
+
+    -- Получаем OID таблицы
+    table_oid := to_regclass(
+        case 
+            when schema_name is not null then format('%I.%I', schema_name, table_name)
+            else format('%I', table_name)
+        end
+    );
+
+    if table_oid is null then
+        show search_path into search_path_arr;
+        if schema_name is not null then
+            raise exception 'Таблица "%" не найдена в схеме "%"', table_name, schema_name;
+        else
+            raise exception 'Таблица "%" не найдена в search_path: %', table_name, search_path_arr;
+        end if;
+    end if;
+
+    -- Если схема не указана, определяем её
+    if schema_name is null then
+        select n.nspname into schema_name
+        from pg_class c
+        join pg_namespace n on n.oid = c.relnamespace
+        where c.oid = table_oid;
+    end if;
+
+    -- Заголовок вывода
     output_text := output_text ||
         'COLUMN NAME            TRIGGER NAME' || E'\n' ||
         '----------------------- ------------------------' || E'\n';
 
+    -- Цикл по триггерам
     for trig_record in
         select
             t.tgname as trigger_name,
@@ -65,7 +118,7 @@ begin
             end loop;
         end if;
 
-        -- Колонки из WHEN
+        -- Колонки из выражений WHEN
         if when_condition is not null then
             for column_name in
                 select distinct m[2]
@@ -77,13 +130,14 @@ begin
             end loop;
         end if;
 
-        -- Если колонок нет
+        -- Если не найдено ни одной колонки
         if not has_columns then
             output_text := output_text ||
                 format('%-20s           %-20s', 'NULL', trig_record.trigger_name) || E'\n';
         end if;
     end loop;
 
+    -- Вывод результата
     output_text := trim(trailing E'\n' from output_text);
     raise notice E'\n%s', output_text;
 
@@ -91,7 +145,8 @@ exception
     when others then
         raise notice 'Ошибка: %', sqlerrm;
         raise notice 'Проверьте:';
-        raise notice '- Корректность schema_name и table_name во временной таблице';
-        raise notice '- Существование таблицы в указанной схеме';
+        raise notice '- Корректность формата имени таблицы (database.schema.table, schema.table, table)';
+        raise notice '- Существование таблицы в указанной схеме или search_path';
+        raise notice '- Соответствие базы данных (если указана) текущей БД';
 end;
 $$ language plpgsql;
